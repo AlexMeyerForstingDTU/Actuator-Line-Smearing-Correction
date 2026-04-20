@@ -186,7 +186,7 @@ c-----[in]
       !           call Vxyz_Vstn(Vstn_nr_nb_j,1,yaw(nrot),tilt(nrot),
       ! &                        azimut(nrot,nbl),
       ! &                        cone(nrot),pitch(nrot),
-      ! &                        bl_cum_sweep(j),bl_cum_cone(j))
+      ! &                        sweep(j),fbend(j))
       !           Vstn(nrot,nbl,j,:)=Vstn_nr_nb_j
       !           ! cartesian to cylindrical coordinate system
       !           Vstn_nr_nb_j=Vrtz(nrot,nbl,j,:)
