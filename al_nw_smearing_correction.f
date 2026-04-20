@@ -14,12 +14,15 @@ c                    Ang Li
 c     Revisions : 
 c         date   |      author     |    task
 c     - 24-07-19 | A MeyerForsting | Version 1.0
+c     - 20-04-26 | A MeyerForsting | Version 2.0: Full 3D kinematics,
+c                                    Ang Li correction, standalone mode.
 c
 c     Purpose of file: Correct actuator line forces for the missing
 c                      induction, originating from the force smearing at
 c                      the control points. This code is an 
 c                      implementation of the correction presented in 
-c                      Meyer Forsting et al. (2019). 
+c                      Meyer Forsting et al. (2019). Now supports full
+c                      3D swept and pre-bent blade geometries natively.
 c
 c     Overview of functions contained in this file:
 c     - module nw_smearing_correction_module
@@ -32,6 +35,7 @@ c     - subroutine nw_circulation()
 c     - subroutine nw_calc_relax()
 c     - subroutine init_nw_smearing_correction()
 c     - subroutine nw_interp1d()
+c     - subroutine nw2vstn() and standalone coordinate transforms
 c
 c-----------------------------------------------------------------------
 c     This file contains all elements necessary for running the smearing
@@ -101,6 +105,8 @@ c-----------------------------------------------------------------------
       real(kind=idp)::pi=4.d0*atan(1.d0)
       ! Convergence limit of induced velocity residual (default value)
       real(kind=idp)::nw_max_resid=1d-6
+      ! Location of aoa computation (default value)
+      real(kind=idp)::x_aoa=0.5d0
       ! Constants of the Near-wake model
       real(kind=idp),dimension(4,5)::nw_N,nw_P
       ! Variables from previous time step: For smooth transition between
@@ -118,63 +124,130 @@ c-----------------------------------------------------------------------
 c=======================================================================
 c=======================================================================
       subroutine nw_smearing_correction(i,j,
-     &                                  r_cp,r_vtp,vn_cfd,vt_cfd,
+     &                                  cyl_cp,cyl_vtp,
+     &                                  vstn_cfd,vcyl_cfd,
      &                                  eps_cp,omega,chord,twist,pitch,
      &                                  cl_2d,cd_2d,alpha_2d,len_2d,
-     &                                  Fstn)
+     &                                  Fstn,angli,cone,fbend,sweep,
+     &                                  dsweep)
 c------------------------------------------------------
 c     The smearing function leads to a loss of vorticity,
 c     which in turn leads to lower induced velocities. The
 c     missing velocity is calculated by a near wake model
 c     and used to correct the angle of attack.
 c-----------------------------------------------------------------------
-      use params,only:idp          ! Global precision 
-      use ns_contr,only:timestep0, ! Global time step
-     &                  grlev,     ! Grid level
-     &                  density,   ! Air density
-     &                  time       ! Global time 
-      use nw_smearing_correction_module 
-c-----------------------------------------------------------------------      
+      use params, only: idp          ! Global precision
+      use ns_contr, only: timestep0, ! Global time step
+     &                    grlev,     ! Grid level
+     &                    density,   ! Air density
+     &                    time       ! Global time
+      use nw_smearing_correction_module, only: nw_W_history,nw_a,nw_dy
+     &     ,nw_vt_history,nw_vn_history
+     &     ,nw_Gamma_history,nw_dyn_comp_history,nw_X_history
+     &     ,nw_Y_history,n_s,n_v,kaya,n_rotors,nw_max_resid
+     &     ,kaya_refresh,nw_phi,smear_fac,cp_loop_ind,nw_phi_s,nw_dx
+     &     ,x_aoa,pi
+c-----------------------------------------------------------------------
       implicit none
-c-----[in]   
-      integer,intent(in)::i,     ! ith rotor
-     &                    j,     ! jth blade
-     &                    len_2d ! Length of 2D airfoil data
+c-----[in]
+      integer,intent(in):: i,     ! ith rotor
+     &                     j,     ! jth blade
+     &                     len_2d ! Length of 2D airfoil data
+      !-----------------------------------------------------------------
+      ! Coordinate Systems Guide:
+      ! * stn (Local Blade Section Frame for velocities/forces): 
+      !    1 (s): spanwise (along the blade pitch axis)
+      !    2 (t): tangential (chordwise, in-plane with local section)
+      !    3 (n): normal (flapwise, out-of-plane with local section)
+      ! * cyl (Cylindrical Rotor Frame): 
+      !    1 (r): radial (distance from rotational axis)
+      !    2 (theta): azimuthal (tangential to rotor rotation)
+      !    3 (z): axial (normal to the rotor disc plane)
+      !    Note: Position coordinates (cyl_cp, cyl_vtp) are passed in 
+      !          this frame (rigidly pitched and coned, but independent  
+      !          of local sweep/bend) to correctly calculate distances.
+      !
+      ! Using transformation tools contained here, the stn and cyl 
+      ! velocities from the Cartesian CFD coordinate system are given
+      ! by:
+      !        !----Coordinate transformatin of velocities----
+      !        Vstn=Vxyz
+      !        Vrtz=Vxyz
+      !        do nrot=1,mrot; do nbl=1,nblade; do j=1,jrot-1;
+      !           ! cartesian to blade local
+      !           Vstn_nr_nb_j=Vstn(nrot,nbl,j,:)
+      !           call Vxyz_Vstn(Vstn_nr_nb_j,1,yaw(nrot),tilt(nrot),
+      ! &                        azimut(nrot,nbl),
+      ! &                        cone(nrot),pitch(nrot),
+      ! &                        bl_cum_sweep(j),bl_cum_cone(j))
+      !           Vstn(nrot,nbl,j,:)=Vstn_nr_nb_j
+      !           ! cartesian to cylindrical coordinate system
+      !           Vstn_nr_nb_j=Vrtz(nrot,nbl,j,:)
+      !           call Vxyz_Vstn(Vstn_nr_nb_j,1,yaw(nrot),tilt(nrot),
+      ! &                        azimut(nrot,nbl),
+      ! &                        0.0,0.0,0.0,0.0)
+      !           Vrtz(nrot,nbl,j,:)=Vstn_nr_nb_j
+      !        enddo; enddo; enddo
+      !-----------------------------------------------------------------
       real(kind=idp),intent(in)::
-     & r_cp(n_s),   ! Radial coordinate of control points (CP)
-     & r_vtp(n_v),  ! Radial coordinate of vortex trailing points   
-     & vn_cfd(n_s), ! Normal velocities at CPs from CFD domain
-     & vt_cfd(n_s), ! Tangential velocities at CPs from CFD domain
+     & cyl_cp(n_s,3),   ! 3D cyl coordinates of control points (CP)
+     & cyl_vtp(n_v,3),  ! 3D cyl coordinates of vortex trailing points
+     & vstn_cfd(n_s,3), ! Velocities at CPs in local stn coordinate system
+     & vcyl_cfd(n_s,3), ! Velocities at CPs in rotor cylindrical frame
      & eps_cp,      ! Epsilon, the smearing length scale
      & omega,       ! Rotational speed in radiens/sec
-     & chord(n_s),  ! Chord distribution along blade at CPs 
+     & chord(n_s),  ! Chord distribution along blade at CPs
      & twist(n_s),  ! Twist distribution along blade at CPs
-     & pitch,       ! Blade pitch
+     & pitch,       ! Blade pitch [deg] (+ve to feather)
      & cl_2d(len_2d,n_s),    ! Airfoil lift coeff. curve at CPs
      & cd_2d(len_2d,n_s),    ! Airfoil drag coeff. curve at CPs
-     & alpha_2d(len_2d,n_s)  ! Alpha values of lift&drag curves
+     & alpha_2d(len_2d,n_s), ! Alpha values of lift&drag curves
+     & cone,        ! Rigid blade coning [deg] (+ve upstream)
+      !-----------------------------------------------------------------
+      ! 3D Blade Kinematic Angles (all in degrees):
+      ! Let P_s, P_t, P_n be the blade curve length, tangential displacement
+      ! (+ve in direction of rotation), and normal displacement (+ve 
+      ! downstream) respectively. Between an inner (in) and outer (out) 
+      ! blade section edge:
+      ! * fbend:  Local out-of-plane bending angle (+ve upstream)
+      !           atan2(-(P_n_out - P_n_in), (P_s_out - P_s_in)) * 180/pi
+      ! * sweep:  Local in-plane sweep angle (+ve in direction of rotation)
+      !           atan2((P_t_out - P_t_in), (P_s_out - P_s_in)) * 180/pi
+      ! * dsweep: Difference between local sweep and root-based sweep
+      !           sweep - (atan2(P_t_out, P_s_out) * 180/pi)
+      !-----------------------------------------------------------------
+     & fbend(n_s),  ! Local blade bending [deg] (+ve upstream)
+     & sweep(n_s),  ! Local blade sweep [deg] (+ve in dir. of rotation)
+     & dsweep(n_s)  ! Local blade delta sweep [deg]
       ! Note that the radial coordiante is defined along the blade and
-      ! starts at the rotor centre. The radial coordinate should be 
+      ! starts at the rotor centre. The radial coordinate should be
       ! ascending and r_vtp(1)>0.
-c-----[out] Forces at CPs, 1:spanwise, 2:tangential, 3:normal 
-      real(kind=idp),intent(out)::Fstn(n_s,3)
+      logical,intent(in):: angli
+c-----[out] Forces at CPs, 1:spanwise, 2:tangential, 3:normal
+      real(kind=idp),intent(out):: Fstn(n_s,3)
 c-----[tmp]
-      logical :: nw_recompute_relax,nw_converged
-      integer :: nw_sub_iter, k, l
-      real(kind=idp)::dt_global, h, h_r, nw_resmax, nw_relax,
-     &                nw_relax_safety,core_cutoff,
-     &                rtc,cpu_t1,cpu_t2      
-      real(kind=idp),dimension(n_s):: 
-     &               cl_inter, cd_inter, Gamma_cp, 
+      logical:: nw_recompute_relax,nw_converged
+      integer:: nw_sub_iter, k, l
+      real(kind=idp):: dt_global, h, h_r, nw_resmax, nw_relax,
+     &                 nw_relax_safety,core_cutoff,delta,
+     &                 rtc,cpu_t1,cpu_t2,
+     &                 d2r=4.d0*atan(1.d0)/180.d0,
+     &                 r2d=180.d0/(4.d0*atan(1.d0))
+      real(kind=idp),dimension(n_s)::
+     &               cl_inter, cd_inter, Gamma_cp,
      &               Gamma_cp_steady, phi_cp_cfd, alpha_cp_cfd,
      &               lift_cp, drag_cp, nw_section_res, nw_vn,nw_vt,
-     &               nw_W, phi_cp, alpha_cp, vrel_cp, nw_W_iter
+     &               nw_W, phi_cp, alpha_cp, vrel_cp, nw_W_iter,
+     &               phi_cp_14, alpha_cp_14, alpha_cp_34, thetadot,
+     &               scone,ccone,tcone,v_rot,vt_rot,vn_rot,phi_cp_cyl,
+     &               r_cp
       real(kind=idp),dimension(n_v)::
-     &               phi_vtp,vrel_vtp, dGamma_vtp,nw_dbeta
-      real(kind=idp)::nw_dyn_comp(n_s,3),
-     &                nw_X(n_v,n_s),nw_Y(n_v,n_s),nw_phi_star(n_v,n_s)
+     &               phi_vtp,vrel_vtp, dGamma_vtp,nw_dbeta,r_vtp
+      real(kind=idp):: nw_dyn_comp(n_s,3), nw_vstn(n_s,3),
+     &                 nw_X(n_v,n_s),nw_Y(n_v,n_s),nw_phi_star(n_v,n_s)
 c=======================================================================
       if(.not.kaya)return ! Switch model on/off
+      r_cp=cyl_cp(:,1);r_vtp=cyl_vtp(:,1)
       ! Test whether the first coordinate is close to zero. This is a
       ! singularity.
       if(r_vtp(1)<0.1d0)then
@@ -199,6 +272,15 @@ c=======================================================================
       nw_W = nw_W_history(i,j,:)
       nw_vn =  nw_vn_history(i,j,:)
       nw_vt =  nw_vt_history(i,j,:)
+      !----Compute standard terms----
+      ! precompute sine and cosines
+      scone = sin((cone+fbend)*d2r); ccone = cos((cone+fbend)*d2r);
+      ! Rotational velocity components in local section coordinates
+      v_rot = -(omega*r_cp)
+      ! normal
+      vn_rot = -v_rot*sin(-pitch*d2r)
+      ! tangential
+      vt_rot = v_rot*cos(-pitch*d2r)*cos(dsweep*d2r)
 
       !+++++++++++++++++++++ ONLY IF REFRESH NEEDED ++++++++++++++++++++
       if (kaya_refresh(i,j))then 
@@ -222,9 +304,9 @@ c=======================================================================
               call nw_hr_components(h,h_r,nw_phi(i,j,k,l),
      &                                nw_phi_s(i,j,k,l),nw_dx(i,j,k,l),
      &                                nw_dy(i,j,k,l),nw_a(i,j,k,l,:))
-              ! Compute the smearing factor, which is fixed in this 
+              ! Compute the smearing factor, which is fixed in this
               ! implementation i.e. beta=0
-              call smearing_factor(r_vtp(k),h_r,eps_cp,
+              call smearing_factor(r_vtp(k),h_r,0d0,0d0,eps_cp,
      &                             smear_fac(i,j,k,l))
               ! Finally determine which blade sections are influenced
               ! by the vtpex core. For a Gaussian the 99th percentile
@@ -251,8 +333,10 @@ c=======================================================================
           ! The physical flow angle does not change during a CFD
           ! iteration. Therefore there are no sub-iterations needed. 
           !----Flow/helix angle----
+          ! This angle is between the vortex and a plane perpendicular
+          ! to the rotational axis (not local to sections).
           ! Extracted from CFD at control points
-          phi_cp_cfd = atan2(vn_cfd,omega*r_cp-vt_cfd) 
+          phi_cp_cfd = atan2(vcyl_cfd(:,3),-(v_rot+vcyl_cfd(:,2)))
           ! Ensure that the angle is below |90| degrees
           do l = 1,n_s
             if (phi_cp_cfd(l).gt.pi/2d0) then 
@@ -262,11 +346,11 @@ c=======================================================================
           ! Trailing points
           ! Interpolate from CPs
           call nw_interp1d(r_cp,phi_cp_cfd,n_s,
-     &                    r_vtp(2:n_v-1),phi_vtp(2:n_v-1),n_s-1)            
+     &                     r_vtp(2:n_v-1),phi_vtp(2:n_v-1),n_s-1)
           phi_vtp(1) = phi_cp_cfd(1)
           phi_vtp(n_v) = phi_cp_cfd(n_s)
 
-          !----Near Wake phi components---- 
+          !----Near Wake phi components----
           do k = 1,n_v
             do l =  cp_loop_ind(i,j,k,1),cp_loop_ind(i,j,k,2)
               ! Distance between trailing point and CP
@@ -274,7 +358,11 @@ c=======================================================================
               h_r = h/r_vtp(k)
               call nw_phi_components(h_r,nw_a(i,j,k,l,:),phi_vtp(k),
      &                               nw_phi(i,j,k,l),nw_phi_s(i,j,k,l),
-     &                               nw_phi_star(k,l))          
+     &                               nw_phi_star(k,l))
+              ! disc normal distance (+ve upstream)
+              delta = -(cyl_vtp(k,3)-cyl_cp(l,3))
+              call smearing_factor(r_vtp(k),h_r,delta,phi_vtp(k),eps_cp,
+     &                             smear_fac(i,j,k,l))
             enddo
           enddo  
 
@@ -285,19 +373,20 @@ c=======================================================================
 
             !============= Velocities & Flow angles  ===================
             !----Control points----
-            ! Corrected flow angle
-            phi_cp = atan2(vn_cfd+nw_vn,
-     &                     omega*r_cp-vt_cfd-nw_vt)
+            ! Corrected flow angle (project nw velocities from
+            ! cylindrical to local reference frame)
+            call nw2vstn(nw_vt,nw_vn,n_s,cone,pitch,sweep,fbend,nw_vstn)
+            phi_cp = atan2(vn_rot+vstn_cfd(:,3)+nw_vstn(:,3),
+     &                     -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)))
             ! Angle-of-attack at CP
-            alpha_cp = phi_cp*180.d0/pi-twist-pitch
-
+            alpha_cp = phi_cp*r2d-twist
             ! Relative wind speed at the control points
-            vrel_cp = sqrt((vn_cfd+nw_vn)**2 + 
-     &                     (omega*r_cp-vt_cfd-nw_vt)**2)
+            vrel_cp = sqrt((vn_rot+vstn_cfd(:,3)+nw_vstn(:,3))**2 +
+     &                     (vt_rot+vstn_cfd(:,2)+nw_vstn(:,2))**2)
             !----Trailing points----
             ! Interpolate the velocity at the trailing points
             call nw_interp1d(r_cp,vrel_cp,n_s,
-     &                    r_vtp(2:n_v-1),vrel_vtp(2:n_v-1),n_s-1)
+     &                       r_vtp(2:n_v-1),vrel_vtp(2:n_v-1),n_s-1)
             ! Take velcoities from outer CPs (typical in LL codes)
             vrel_vtp(1) = vrel_cp(1)
             vrel_vtp(n_v) = vrel_cp(n_s)
@@ -310,10 +399,10 @@ c=======================================================================
      &             Gamma_cp_steady,Gamma_cp,dGamma_vtp,nw_dyn_comp)
             !++++++++++++++++++ Velocity history +++++++++++++++++++++++
             ! Local advance in beta (rotation)
-            nw_dbeta = (vrel_vtp*dt_global)/r_vtp          
+            nw_dbeta = (vrel_vtp*dt_global)/r_vtp
             !============ Calculate new velocity =======================
-            ! Determine the velocity induced by vorticity shed during  
-            ! the current time step. 
+            ! Determine the velocity induced by vorticity shed during
+            ! the current time step.
             nw_W_iter = 0d0 ! Initialize
             nw_X = 0d0; nw_Y = 0d0
             do k = 1,n_v
@@ -322,7 +411,7 @@ c=======================================================================
                h = r_vtp(k)-r_cp(l)
                h_r = h/r_vtp(k)
 
-               !----Near Wake velocity components---- 
+               !----Near Wake velocity components----
                call nw_XY_components(nw_phi_star(k,l),nw_dx(i,j,k,l),
      &                 nw_dy(i,j,k,l),nw_dbeta(k),dGamma_vtp(k),
      &                 nw_X_history(i,j,k,l),nw_Y_history(i,j,k,l),
@@ -336,10 +425,11 @@ c=======================================================================
             !============== Relaxation factor ==========================
             if (nw_recompute_relax)then
               call nw_calc_relax(vrel_cp,alpha_cp,
-     &                     (omega*r_cp-vt_cfd-nw_vt),(vn_cfd+nw_vn),
+     &                      -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)),
+     &                      vn_rot+vstn_cfd(:,3)+nw_vstn(:,3),
      &                      chord,dt_global,nw_dx,nw_dy,nw_dbeta,nw_phi,
      &                      nw_relax_safety,nw_relax)
-              ! After computing it once 
+              ! After computing it once
               nw_recompute_relax = .false.
             endif
 
@@ -347,15 +437,17 @@ c=======================================================================
             ! Advance velocity correction with relaxation
             nw_W_iter = nw_relax*nw_W+(1d0-nw_relax)*nw_W_iter
             !=================== Residual ==============================
-            ! Tip vortex less than 45 degrees away from rotor plane: 
-            ! convergence determined by axial induction otherwise 
-            ! convergence determined by tangential induction  
+            ! Tip vortex less than 45 degrees away from rotor plane:
+            ! convergence determined by axial induction otherwise
+            ! convergence determined by tangential induction
             nw_section_res=sqrt((nw_W_iter-nw_W)**2)
-
-            if(phi_vtp(n_v).lt.pi/4d0)then 
-              nw_resmax = maxval(nw_section_res*cos(phi_cp))
+            ! Determine helix angle (cylindrical coordinate system)
+            phi_cp_cyl = atan2(vcyl_cfd(:,3)+nw_vn,
+     &                         -(v_rot+vcyl_cfd(:,2)+nw_vt))
+            if(phi_vtp(n_v).lt.pi/4d0)then
+              nw_resmax = maxval(nw_section_res*cos(phi_cp_cyl))
             else
-              nw_resmax = maxval(nw_section_res*sin(phi_cp))
+              nw_resmax = maxval(nw_section_res*sin(phi_cp_cyl))
             endif
 
             !=============== Convergence ===============================
@@ -366,13 +458,13 @@ c=======================================================================
               nw_converged = .true.
             endif
 
-            !----100 Iterations---- 
+            !----100 Iterations----
             if (nw_sub_iter.eq.100)then
               nw_recompute_relax = .true.
             endif
             
-            !----500 Iterations---- 
-            ! If no convergence was reached after 500 iterations change 
+            !----500 Iterations----
+            ! If no convergence was reached after 500 iterations change
             ! the relaxation and skip this time step
             if (nw_sub_iter.eq.500)then
               if(nw_relax_safety.lt.0.8d0) then
@@ -387,14 +479,14 @@ c=======================================================================
               nw_vt =  nw_vt_history(i,j,:)
               nw_dyn_comp = nw_dyn_comp_history(i,j,:,:)
               Gamma_cp_steady = nw_Gamma_history(i,j,:)
-              nw_X = nw_X_history(i,j,:,:) 
+              nw_X = nw_X_history(i,j,:,:)
               nw_Y = nw_Y_history(i,j,:,:)
 
             else
             !============== While loop update===========================
-              nw_W = nw_W_iter 
-              nw_vn = nw_W*cos(phi_cp)
-              nw_vt = nw_W*sin(phi_cp)
+              nw_W = nw_W_iter
+              nw_vn = nw_W*cos(phi_cp_cyl)
+              nw_vt = nw_W*sin(phi_cp_cyl)
             endif
           enddo 
           !********************* END ITERATING  ************************
@@ -402,37 +494,53 @@ c=======================================================================
           !===================== Blade forces ==========================
 
           !----Flow/helix angle----
-          ! Corrected 
-          phi_cp = atan2(vn_cfd+nw_vn,omega*r_cp-vt_cfd-nw_vt)
+          ! cylindrical to local reference frame)
+          call nw2vstn(nw_vt,nw_vn,n_s,cone,pitch,sweep,fbend,nw_vstn)
+          ! Corrected
+          phi_cp = atan2(vn_rot+vstn_cfd(:,3)+nw_vstn(:,3),
+     &                   -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)))
           !----Angle-of-Attack----
-          ! Corrected 
-          alpha_cp = phi_cp*180.d0/pi-twist-pitch
+          ! Corrected
+          alpha_cp = phi_cp*r2d-twist
           ! CFD
-          alpha_cp_cfd = phi_cp_cfd*180.d0/pi-twist-pitch
-
+          alpha_cp_cfd = phi_cp_cfd*r2d-twist
+          !----Relative velocity----
+          vrel_cp = sqrt((vn_rot+vstn_cfd(:,3)+nw_vstn(:,3))**2 +
+     &                   (vt_rot+vstn_cfd(:,2)+nw_vstn(:,2))**2)
+          !----Ang Li unsteady AoA correction----
+          ! Accounts for the curved trajectory of coned/bent blades using
+          ! unsteady thin-airfoil theory. Effective AoA for lift/drag is
+          ! evaluated at 3/4-chord; force projection angle at 1/4-chord.
+          if(angli)then
+            thetadot = -omega*scone*r2d
+            alpha_cp_34 = alpha_cp + (0.75d0-x_aoa)*chord/vrel_cp
+     &                               *thetadot
+            alpha_cp_14 = alpha_cp + (0.25d0-x_aoa)*chord/vrel_cp
+     &                               *thetadot
+          else
+            alpha_cp_34 = alpha_cp
+            alpha_cp_14 = alpha_cp
+          endif
+          phi_cp_14 = (alpha_cp_14+twist)*d2r
           !----Lift & drag coefficients----
           do l= 1,n_s
-           call nw_interp1d(alpha_2d(:,l),cl_2d(:,l),len_2d,alpha_cp(l),
-     &                                        cl_inter(l),1)
-           call nw_interp1d(alpha_2d(:,l),cd_2d(:,l),len_2d,alpha_cp(l),
-     &                                  cd_inter(l),1)
+           call nw_interp1d(alpha_2d(:,l),cl_2d(:,l),len_2d,
+     &                                    alpha_cp_34(l),cl_inter(l),1)
+           call nw_interp1d(alpha_2d(:,l),cd_2d(:,l),len_2d,
+     &                                    alpha_cp_34(l),cd_inter(l),1)
           enddo
-          !----Relative velocity----
-          vrel_cp = sqrt((vn_cfd+nw_vn)**2 + 
-     &                   (omega*r_cp-vt_cfd-nw_vt)**2)
-
           !----Aerodynamic forces----
-          ! Lift 
+          ! Lift
           lift_cp = 0.5d0*density*vrel_cp**2*chord*cl_inter
           ! Drag
           drag_cp = 0.5d0*density*vrel_cp**2*chord*cd_inter
 
           !----Forces----
           ! These forces lead to the source terms and are defined as
-          ! spanwise, tangential and normal to the blade.          
+          ! spanwise, tangential and normal to the blade.
           Fstn(:,1) = 0.0d0
-          Fstn(:,2) = lift_cp*sin(phi_cp)-drag_cp*cos(phi_cp)
-          Fstn(:,3) = lift_cp*cos(phi_cp)+drag_cp*sin(phi_cp)
+          Fstn(:,2) = lift_cp*sin(phi_cp_14)-drag_cp*cos(phi_cp_14)
+          Fstn(:,3) = lift_cp*cos(phi_cp_14)+drag_cp*sin(phi_cp_14)
 
           cpu_t2 = rtc() ! Stop timing
           !=================== Output ==================================
@@ -442,7 +550,7 @@ c=======================================================================
 
           !=================== Saving iteration ========================
           nw_W_history(i,j,:) = nw_W
-          nw_dyn_comp_history(i,j,:,:) = nw_dyn_comp 
+          nw_dyn_comp_history(i,j,:,:) = nw_dyn_comp
           nw_Gamma_history(i,j,:) = Gamma_cp_steady
           nw_vn_history(i,j,:) = nw_vn
           nw_vt_history(i,j,:) = nw_vt
@@ -454,31 +562,31 @@ c=======================================================================
       end subroutine nw_smearing_correction
 c=======================================================================
 c=======================================================================
-      subroutine smearing_factor(r,h_r,epsilon,smear_fac)   
+      subroutine smearing_factor(r,h_r,delta,phi,epsilon,smear_fac)
 c-----------------------------------------------------------------------
-c     The Gaussian smearing results in a Lamb-Oseen like vortex. The 
-c     smearing in the induced velocity can directly be determined from 
-c     their analytical solution. 
+c     The Gaussian smearing results in a Lamb-Oseen like vortex. The
+c     smearing in the induced velocity can directly be determined from
+c     their analytical solution.
 c     Definition and details in Meyer Forsting et al. (2019).
 c-----------------------------------------------------------------------
-      use params,only:idp ! Global precision
-c-----------------------------------------------------------------------      
-      implicit none    
-c-----[in]        
-      real(kind=idp),intent(in)::r,h_r,epsilon
-c-----[out]      
-      real(kind=idp),intent(out)::smear_fac 
-c-----[tmp]      
-      real(kind=idp)::dist_orth
-c=======================================================================      
-      ! The definition of the smearing factor is given in Eq.(22) with 
-      ! the perpendicular distance between vortex element and control 
-      ! point defined in Eq.(21). Setting beta to zero, the expression 
-      ! is greatly simplified. 
+      use params, only: idp ! Global precision
+c-----------------------------------------------------------------------
+      implicit none
+c-----[in]
+      real(kind=idp),intent(in):: r,h_r,epsilon,delta,phi
+c-----[out]
+      real(kind=idp),intent(out):: smear_fac
+c-----[tmp]
+      real(kind=idp):: dist_orth_sq
+c=======================================================================
+      ! The definition of the smearing factor is given in Eq.(22) with
+      ! the perpendicular distance between vortex element and control
+      ! point defined in Eq.(21). Setting beta to zero, the expression
+      ! is greatly simplified.
       ! Distance between CP and vortex trailing point
-      dist_orth = (r*h_r)
+      dist_orth_sq = (r*h_r)**2+(delta*cos(phi))**2
       ! The smearing factor
-      smear_fac = exp(-dist_orth**2/epsilon**2)
+      smear_fac = exp(-dist_orth_sq/epsilon**2)
 
       end subroutine smearing_factor
 c=======================================================================
@@ -773,9 +881,13 @@ c=======================================================================
 c-----------------------------------------------------------------------      
 c     Initialize the arrays needed in the near-wake smearing corection. 
 c-----------------------------------------------------------------------  
-      use nw_smearing_correction_module ! Assign all 
-      use TurbineData,only:ACLproject,aclnamelen ! Project name 
-      use params,only:MyProcNum ! Get the processor nr. 
+      use nw_smearing_correction_module, only: nw_P,nw_N,nw_phi_s
+     &     ,nw_X_history,nw_Y_history,nw_vn_history,nw_vt_history
+     &     ,nw_Gamma_history,nw_dyn_comp_history,nw_W_history,nw_phi
+     &     ,nw_dx,nw_dy,nw_a,cp_loop_ind,smear_fac,kaya_refresh,kaya
+     &     ,n_blades,n_rotors,n_s,n_v ! Assign all
+      use TurbineData, only: ACLproject,aclnamelen ! Project name
+      use params, only: MyProcNum ! Get the processor nr.
 c-----------------------------------------------------------------------
       implicit none   
 c-----[in]  
@@ -918,3 +1030,188 @@ c------  interpolate
 
       end subroutine nw_interp1d
 c=======================================================================
+c=======================================================================
+c     COORDINATE TRANSFORMATION SUBROUTINES
+c     Adapted to make this module completely standalone. Applies the
+c     standard AL rotation hierarchy for 3D local blade kinematics:
+c     yaw -> tilt -> azimut -> cone -> pitch -> sweep -> fbend
+c=======================================================================
+c=======================================================================
+      subroutine nw2vstn(vt,vn,n,cone,pitch,sweep,fbend,vstn)
+c-----------------------------------------------------------------------
+c     Transfrom cylindrical to local section velocities
+c-----------------------------------------------------------------------
+      use params, only: idp
+c-----------------------------------------------------------------------
+      implicit none
+c-----[in]
+      integer,intent(in)::n
+      real(kind=idp),intent(in)::vn(n),vt(n),cone,pitch,
+     &                           sweep(n),fbend(n)
+c-----[out]
+      real(kind=idp),intent(out)::vstn(n,3)
+c-----[in]
+      integer::i,j
+      real(kind=idp)::tmp(3)=0.d0
+c=======================================================================
+      do i=1,n
+         tmp(2)=vt(i); tmp(3)=vn(i)
+         call Vxyz_Vstn(tmp,1,0.d0,0.d0,0.d0,
+     &                        cone,pitch,sweep(i),fbend(i))
+         vstn(i,:)=tmp
+      enddo
+      end subroutine nw2vstn
+c=======================================================================
+c=======================================================================
+      subroutine Vxyz_Vstn(A,jrot,yaw,tilt,azimut,cone,pitch,
+     &                     sweep,fbend)
+c-----------------------------------------------------------------------
+c     Cartesian to Polar, rotation of velocities with respect to
+c     yaw,tilt,azimut and cone angles
+c-----------------------------------------------------------------------
+      use params, only: idp
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),intent(in):: yaw,tilt,azimut,cone,pitch,sweep,fbend
+      real(kind=idp),dimension(3,jrot),intent(inout):: A
+c-----------------------------------------------------------------------
+      call yawrot(A,jrot,yaw,1.0d0);
+      call tiltrot(A,jrot,tilt,1.0d0);
+      call azimutrot(A,jrot,azimut,-1.0d0);
+      call conerot(A,jrot,cone,1.0d0);
+      call pitchrot(A,jrot,-pitch,-1.d0)
+      call azimutrot(A,jrot,sweep,-1.0d0);
+      call conerot(A,jrot,fbend,1.0d0);
+
+      end subroutine Vxyz_Vstn
+c-----------------------------------------------------------------------
+      subroutine yawrot(A,jrot,yaw,LT)
+c-----------------------------------------------------------------------
+c     Cartesian to Cartesian, rotation about y-axis, yaw
+c-----------------------------------------------------------------------
+      use params, only: idp
+      use nw_smearing_correction_module, only: pi
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),intent(in):: yaw,LT
+      real(kind=idp),dimension(3,jrot),intent(inout):: A
+      real(kind=idp),dimension(3,3):: Phi_yaw
+      real(kind=idp):: c,s
+c-----------------------------------------------------------------------
+      c = dcos(yaw*pi/180.d0); s = LT*dsin(yaw*pi/180.d0)
+      Phi_yaw(1,1) = c;    Phi_yaw(1,2) = 0.d0; Phi_yaw(1,3) =-s;
+      Phi_yaw(2,1) = 0.d0; Phi_yaw(2,2) = 1.d0; Phi_yaw(2,3) = 0.d0;
+      Phi_yaw(3,1) = s;    Phi_yaw(3,2) = 0.d0; Phi_yaw(3,3) = c;
+      call matmu(Phi_yaw,A,jrot)
+      end subroutine yawrot
+c-----------------------------------------------------------------------
+      subroutine tiltrot(A,jrot,tilt,LT)
+c-----------------------------------------------------------------------
+c     Cartesian to Cartesian, rotation about x-axis, tilt
+c-----------------------------------------------------------------------
+      use params, only: idp
+      use nw_smearing_correction_module, only: pi
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),intent(in):: tilt,LT
+      real(kind=idp),dimension(3,jrot),intent(inout):: A
+      real(kind=idp),dimension(3,3):: Phi_tilt
+      real(kind=idp):: c,s
+c-----------------------------------------------------------------------
+      c = dcos(tilt*pi/180.d0); s = LT*dsin(tilt*pi/180.d0)
+      Phi_tilt(1,1) = 1.d0; Phi_tilt(1,2) = 0.d0; Phi_tilt(1,3) = 0.d0;
+      Phi_tilt(2,1) = 0.d0; Phi_tilt(2,2) = c;    Phi_tilt(2,3) = s;
+      Phi_tilt(3,1) = 0.d0; Phi_tilt(3,2) =-s;    Phi_tilt(3,3) = c;
+      call matmu(Phi_tilt,A,jrot)
+      end subroutine tiltrot
+c-----------------------------------------------------------------------
+      subroutine azimutrot(A,jrot,azimut,LT)
+c-----------------------------------------------------------------------
+c     Cartesian to Polar, rotation about z-axis, azimutal
+c-----------------------------------------------------------------------
+      use params, only: idp
+      use nw_smearing_correction_module, only: pi
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),intent(in):: azimut,LT
+      real(kind=idp), dimension(3,jrot),intent(inout):: A
+      real(kind=idp),dimension(3,3):: Theta
+      real(kind=idp):: c,s
+c-----------------------------------------------------------------------
+      c = cos(azimut*pi/180.d0); s = LT*sin(azimut*pi/180.d0)
+      Theta(1,1) = c;    Theta(1,2) =-s;    Theta(1,3) = 0.d0
+      Theta(2,1) = s;    Theta(2,2) = c;    Theta(2,3) = 0.d0
+      Theta(3,1) = 0.d0; Theta(3,2) = 0.d0; Theta(3,3) = 1.d0
+      call matmu(Theta,A,jrot)
+      end subroutine azimutrot
+c-----------------------------------------------------------------------
+      subroutine conerot(A,jrot,cone,LT)
+c-----------------------------------------------------------------------
+c     Polar to Polar, rotation about theta-axis, coning
+c-----------------------------------------------------------------------
+      use params, only: idp
+      use nw_smearing_correction_module, only: pi
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),intent(in):: cone,LT
+      real(kind=idp),dimension(3,jrot),intent(inout):: A
+      real(kind=idp), dimension(3,3):: Gamma
+      real(kind=idp):: c,s
+c-----------------------------------------------------------------------
+      c = dcos(cone*pi/180.d0); s = LT*dsin(cone*pi/180.d0)
+      Gamma(1,1) = c;    Gamma(1,2) = 0.d0; Gamma(1,3) =-s;
+      Gamma(2,1) = 0.d0; Gamma(2,2) = 1.d0; Gamma(2,3) = 0.d0;
+      Gamma(3,1) = s;    Gamma(3,2) = 0.d0; Gamma(3,3) = c;
+      call matmu(Gamma,A,jrot)
+      end subroutine conerot
+c-----------------------------------------------------------------------
+      subroutine pitchrot(A,jrot,pitch,LT)
+c-----------------------------------------------------------------------
+c     Pitch rotation, rotation about s-axis, so +ve to stall
+c-----------------------------------------------------------------------
+      use params, only: idp
+      use nw_smearing_correction_module, only: pi
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),intent(in):: pitch,LT
+      real(kind=idp), dimension(3,jrot),intent(inout):: A
+      real(kind=idp),dimension(3,3):: Theta
+      real(kind=idp):: c,s
+c-----------------------------------------------------------------------
+      c = cos(pitch*pi/180.d0); s = LT*sin(pitch*pi/180.d0)
+      Theta(1,1) = 1.d0; Theta(1,2) =0.d0; Theta(1,3) = 0.d0
+      Theta(2,1) = 0.d0; Theta(2,2) = c;   Theta(2,3) = -s
+      Theta(3,1) = 0.d0; Theta(3,2) = s;   Theta(3,3) = c
+      call matmu(Theta,A,jrot)
+      end subroutine pitchrot
+c-----------------------------------------------------------------------
+      subroutine matmu(B,A,jrot)
+c-----------------------------------------------------------------------
+c     Matmul matrix mult
+c-----------------------------------------------------------------------
+      use params, only: idp
+c-----------------------------------------------------------------------
+      implicit none
+      integer,intent(in):: jrot
+      real(kind=idp),dimension(3,3),intent(in):: B
+      real(kind=idp),dimension(3,jrot):: A,C
+      real(kind=idp):: S
+      integer:: i,j,k
+c-----------------------------------------------------------------------
+      C=0.0d0;
+      do j=1,jrot; do i=1,3;
+        S = 0.0d0
+        do k=1,3
+          S = S + A(k,j)*B(i,k)
+        enddo
+        C(i,j)= S
+      enddo; enddo
+        A=C
+      end subroutine matmu
+c-----------------------------------------------------------------------
