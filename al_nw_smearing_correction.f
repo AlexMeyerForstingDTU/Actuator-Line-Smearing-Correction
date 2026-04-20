@@ -130,13 +130,14 @@ c-----------------------------------------------------------------------
       end module 
 c=======================================================================
 c=======================================================================
-      subroutine nw_smearing_correction(i,j,
+      subroutine nw_smearing_correction(i,j,len_2d,
      &                                  cyl_cp,cyl_vtp,
      &                                  vstn_cfd,vcyl_cfd,
      &                                  eps_cp,omega,chord,twist,pitch,
-     &                                  cl_2d,cd_2d,alpha_2d,len_2d,
-     &                                  Fstn,angli,cone,fbend,sweep,
-     &                                  dsweep)
+     &                                  cl_2d,cd_2d,alpha_2d,
+     &                                  cone,fbend,sweep,dsweep,
+     &                                  l1point,
+     &                                  Fstn)
 c------------------------------------------------------
 c     The smearing function leads to a loss of vorticity,
 c     which in turn leads to lower induced velocities. The
@@ -229,7 +230,7 @@ c-----[in]
       ! Note that the radial coordiante is defined along the blade and
       ! starts at the rotor centre. The radial coordinate should be
       ! ascending and r_vtp(1)>0.
-      logical,intent(in):: angli
+      logical,intent(in):: l1point ! Flag activating 1-point correction
 c-----[out] Forces at CPs, 1:spanwise, 2:tangential, 3:normal
       real(kind=idp),intent(out):: Fstn(n_s,3)
 c-----[tmp]
@@ -518,7 +519,7 @@ c=======================================================================
           ! Accounts for the curved trajectory of coned/bent blades using
           ! unsteady thin-airfoil theory. Effective AoA for lift/drag is
           ! evaluated at 3/4-chord; force projection angle at 1/4-chord.
-          if(angli)then
+          if(l1point)then
             thetadot = -omega*scone*r2d
             alpha_cp_34 = alpha_cp + (0.75d0-x_aoa)*chord/vrel_cp
      &                               *thetadot
