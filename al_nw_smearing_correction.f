@@ -282,7 +282,7 @@ c=======================================================================
       nw_vt =  nw_vt_history(i,j,:)
       !----Compute standard terms----
       ! precompute sine and cosines
-      scone = sin((cone+fbend)*d2r); ccone = cos((cone+fbend)*d2r);
+      scone = sin((cone+fbend)*d2r); ccone = cos((cone+fbend)*d2r)
       ! Rotational velocity components in local section coordinates
       v_rot = -(omega*r_cp)
       ! normal
@@ -435,7 +435,8 @@ c=======================================================================
               call nw_calc_relax(vrel_cp,alpha_cp,
      &                      -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)),
      &                      vn_rot+vstn_cfd(:,3)+nw_vstn(:,3),
-     &                      chord,dt_global,nw_dx,nw_dy,nw_dbeta,nw_phi,
+     &                      chord,dt_global,nw_dx(i,j,:,:),
+     &                      nw_dy(i,j,:,:),nw_dbeta,nw_phi(i,j,:,:),
      &                      nw_relax_safety,nw_relax)
               ! After computing it once
               nw_recompute_relax = .false.
