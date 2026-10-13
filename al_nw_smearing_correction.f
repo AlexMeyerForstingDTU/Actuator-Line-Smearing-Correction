@@ -12,16 +12,24 @@ c     Contributors:  Georg Pirrung,
 c                    Néstor Ramos-García,
 c                    Ang Li 
 c     Revisions : 
-c         date   |      author     |    task
-c     - 24-07-19 | A MeyerForsting | Version 1.0
-c     - 20-04-26 | A MeyerForsting | Version 2.0: Full 3D kinematics,
-c                                    Ang Li correction, standalone mode.
+c         date   |      task
+c     - 24-07-19 | Version 1.0
+c     - 20-04-26 | Version 2.0: Full 3D kinematics, Ang Li correction, 
+c                  standalone mode.
+c     - 05-10-26 | Version 2.1: Bug fixes: sign of D_Y, root correction 
+c                  applied once, relaxation factor, nw2vstn and
+c                  cp_loop_ind reset. Revert to per-vortex projection as 
+c                  in Meyer Forsting et al. (2019). 
+c                  Credit to Ang Li for the bug fixes and improvements
+c                  and Ross Cockcroft for reviewing version 2.0 and 
+c                  providing feedback.
 c
 c     Purpose of file: Correct actuator line forces for the missing
 c                      induction, originating from the force smearing at
 c                      the control points. This code is an 
 c                      implementation of the correction presented in 
-c                      Meyer Forsting et al. (2019). Now supports full
+c                      Meyer Forsting et al. (2019), in the fast form of
+c                      Meyer Forsting et al. (2020). Now supports full
 c                      3D swept and pre-bent blade geometries natively.
 c
 c     Overview of functions contained in this file:
@@ -50,6 +58,9 @@ c     can be achieved through setting kaya_refresh of the specific rotor
 c     and blade to .true.. Variables from previous time steps are 
 c     stored for all rotors and blades in single arrays (variables 
 c     ending on *_history). 
+c     As in Meyer Forsting et al. (2019), activate the correction only
+c     once the starting vortex has moved at least one blade length
+c     downstream of the rotor.
 c
 c     This implementation is based on several scientific publications
 c     related to the smearing correction and the near-wake model, which
@@ -60,6 +71,12 @@ c        Meyer Forsting, A. R., Pirrung, G. R., and Ramos-García, N.:
 c        A vortex-based tip/smearing correction for the actuator line, 
 c        Wind Energ. Sci., 4, 369-383, 
 c        https://doi.org/10.5194/wes-4-369-2019, 2019. 
+c
+c     Meyer Forsting et al. (2020)
+c        Meyer Forsting, A. R., Pirrung, G. R., and Ramos-García, N.: 
+c        Brief communication: A fast vortex-based smearing correction 
+c        for the actuator line, Wind Energ. Sci., 5, 349-353, 
+c        https://doi.org/10.5194/wes-5-349-2020, 2020. 
 c
 c     Pirrung et al. (2016)
 c        Pirrung, G., Madsen, H. A., Kim, T., and Heinz, J.: 
@@ -72,12 +89,23 @@ c        Pirrung, G., Riziotis, V., Madsen, H., Hansen, M., and Kim, T.:
 c        Comparison of a coupled near- and far-wake model with a free-
 c        wake vortex code, Wind Energ. Sci., 2, 15–33, 
 c        https://doi.org/10.5194/wes-2-15-2017, 2017. 
+c        Corrigendum (2020),
+c        https://doi.org/10.5194/wes-2-15-2017-corrigendum
 c
 c     Pirrung et al. (2017b)
-c     Pirrung, G. R., Madsen, H. A., and Schreck, S.: 
+c        Pirrung, G. R., Madsen, H. A., and Schreck, S.: 
 c        Trailed vorticity modeling for aeroelastic wind turbine 
 c        simulations in standstill, Wind Energ. Sci., 2, 521–532, 
 c        https://doi.org/10.5194/wes-2-521-2017, 2017. 
+c        Corrigendum (2020),
+c        https://doi.org/10.5194/wes-2-521-2017-corrigendum
+c
+c     Li et al. (2022)
+c        Li, A., Gaunaa, M., Pirrung, G. R., Meyer Forsting, A., 
+c        and Horcas, S. G.: How should the lift and drag forces be 
+c        calculated from 2-D airfoil data for dihedral or coned wind 
+c        turbine blades?, Wind Energ. Sci., 7, 1341–1365, 
+c        https://doi.org/10.5194/wes-7-1341-2022, 2022.
 c
 c-----------------------------------------------------------------------
 
@@ -123,13 +151,14 @@ c-----------------------------------------------------------------------
       end module 
 c=======================================================================
 c=======================================================================
-      subroutine nw_smearing_correction(i,j,
+      subroutine nw_smearing_correction(i,j,len_2d,
      &                                  cyl_cp,cyl_vtp,
      &                                  vstn_cfd,vcyl_cfd,
      &                                  eps_cp,omega,chord,twist,pitch,
-     &                                  cl_2d,cd_2d,alpha_2d,len_2d,
-     &                                  Fstn,angli,cone,fbend,sweep,
-     &                                  dsweep)
+     &                                  cl_2d,cd_2d,alpha_2d,
+     &                                  cone,fbend,sweep,dsweep,
+     &                                  l1point,lgammafilter, 
+     &                                  Fstn)
 c------------------------------------------------------
 c     The smearing function leads to a loss of vorticity,
 c     which in turn leads to lower induced velocities. The
@@ -179,7 +208,7 @@ c-----[in]
       !           call Vxyz_Vstn(Vstn_nr_nb_j,1,yaw(nrot),tilt(nrot),
       ! &                        azimut(nrot,nbl),
       ! &                        cone(nrot),pitch(nrot),
-      ! &                        bl_cum_sweep(j),bl_cum_cone(j))
+      ! &                        sweep(j),fbend(j))
       !           Vstn(nrot,nbl,j,:)=Vstn_nr_nb_j
       !           ! cartesian to cylindrical coordinate system
       !           Vstn_nr_nb_j=Vrtz(nrot,nbl,j,:)
@@ -222,7 +251,9 @@ c-----[in]
       ! Note that the radial coordiante is defined along the blade and
       ! starts at the rotor centre. The radial coordinate should be
       ! ascending and r_vtp(1)>0.
-      logical,intent(in):: angli
+      logical,intent(in):: l1point ! Flag activating 1-point correction
+      logical,intent(in):: lgammafilter ! Flag activating time filtering 
+                                        ! of circulation
 c-----[out] Forces at CPs, 1:spanwise, 2:tangential, 3:normal
       real(kind=idp),intent(out):: Fstn(n_s,3)
 c-----[tmp]
@@ -245,6 +276,7 @@ c-----[tmp]
      &               phi_vtp,vrel_vtp, dGamma_vtp,nw_dbeta,r_vtp
       real(kind=idp):: nw_dyn_comp(n_s,3), nw_vstn(n_s,3),
      &                 nw_X(n_v,n_s),nw_Y(n_v,n_s),nw_phi_star(n_v,n_s)
+      real(kind=idp),dimension(n_s):: nw_Wn_iter,nw_Wt_iter
 c=======================================================================
       if(.not.kaya)return ! Switch model on/off
       r_cp=cyl_cp(:,1);r_vtp=cyl_vtp(:,1)
@@ -274,7 +306,7 @@ c=======================================================================
       nw_vt =  nw_vt_history(i,j,:)
       !----Compute standard terms----
       ! precompute sine and cosines
-      scone = sin((cone+fbend)*d2r); ccone = cos((cone+fbend)*d2r);
+      scone = sin((cone+fbend)*d2r); ccone = cos((cone+fbend)*d2r)
       ! Rotational velocity components in local section coordinates
       v_rot = -(omega*r_cp)
       ! normal
@@ -293,6 +325,10 @@ c=======================================================================
         ! this region the missing induction from the vortex smearing 
         ! is neglegible.
         core_cutoff = 1.82d0*eps_cp   
+        ! Reset the CP loop limits, so that no limits of a previous
+        ! geometry remain
+        cp_loop_ind(i,j,:,1) = 1
+        cp_loop_ind(i,j,:,2) = n_s
 
           do k = 1, n_v
             do l = 1,n_s
@@ -396,6 +432,7 @@ c=======================================================================
             call nw_circulation(dt_global,vrel_cp,alpha_cp,
      &             nw_Gamma_history(i,j,:),nw_dyn_comp_history(i,j,:,:),
      &             alpha_2d,cl_2d,len_2d,chord,
+     &             lgammafilter, 
      &             Gamma_cp_steady,Gamma_cp,dGamma_vtp,nw_dyn_comp)
             !++++++++++++++++++ Velocity history +++++++++++++++++++++++
             ! Local advance in beta (rotation)
@@ -404,6 +441,7 @@ c=======================================================================
             ! Determine the velocity induced by vorticity shed during
             ! the current time step.
             nw_W_iter = 0d0 ! Initialize
+            nw_Wn_iter = 0d0; nw_Wt_iter = 0d0
             nw_X = 0d0; nw_Y = 0d0
             do k = 1,n_v
                do l =  cp_loop_ind(i,j,k,1),cp_loop_ind(i,j,k,2)
@@ -420,14 +458,23 @@ c=======================================================================
                !----Velocity correction----
                nw_W_iter(l) = nw_W_iter(l)+ smear_fac(i,j,k,l)*
      &                       (nw_X(k,l)+nw_Y(k,l))
+               ! Axial and tangential parts, with the helix angle of
+               ! each vortex (Meyer Forsting et al. 2019, Eq.(19))
+               nw_Wn_iter(l) = nw_Wn_iter(l)+ smear_fac(i,j,k,l)*
+     &               (nw_X(k,l)+nw_Y(k,l))*cos(phi_vtp(k))
+               nw_Wt_iter(l) = nw_Wt_iter(l)+ smear_fac(i,j,k,l)*
+     &               (nw_X(k,l)+nw_Y(k,l))*sin(phi_vtp(k))
                enddo
             enddo
             !============== Relaxation factor ==========================
             if (nw_recompute_relax)then
+              ! Normal velocity before tangential velocity, matching
+              ! nw_calc_relax(...,vn,vt,...)
               call nw_calc_relax(vrel_cp,alpha_cp,
-     &                      -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)),
      &                      vn_rot+vstn_cfd(:,3)+nw_vstn(:,3),
-     &                      chord,dt_global,nw_dx,nw_dy,nw_dbeta,nw_phi,
+     &                      -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)),
+     &                      chord,dt_global,nw_dx(i,j,:,:),
+     &                      nw_dy(i,j,:,:),nw_dbeta,nw_phi(i,j,:,:),
      &                      nw_relax_safety,nw_relax)
               ! After computing it once
               nw_recompute_relax = .false.
@@ -441,7 +488,7 @@ c=======================================================================
             ! convergence determined by axial induction otherwise
             ! convergence determined by tangential induction
             nw_section_res=sqrt((nw_W_iter-nw_W)**2)
-            ! Determine helix angle (cylindrical coordinate system)
+            ! Helix angle at the CPs, used to weight the residual
             phi_cp_cyl = atan2(vcyl_cfd(:,3)+nw_vn,
      &                         -(v_rot+vcyl_cfd(:,2)+nw_vt))
             if(phi_vtp(n_v).lt.pi/4d0)then
@@ -485,8 +532,8 @@ c=======================================================================
             else
             !============== While loop update===========================
               nw_W = nw_W_iter
-              nw_vn = nw_W*cos(phi_cp_cyl)
-              nw_vt = nw_W*sin(phi_cp_cyl)
+              nw_vn = nw_relax*nw_vn+(1d0-nw_relax)*nw_Wn_iter
+              nw_vt = nw_relax*nw_vt+(1d0-nw_relax)*nw_Wt_iter
             endif
           enddo 
           !********************* END ITERATING  ************************
@@ -511,7 +558,7 @@ c=======================================================================
           ! Accounts for the curved trajectory of coned/bent blades using
           ! unsteady thin-airfoil theory. Effective AoA for lift/drag is
           ! evaluated at 3/4-chord; force projection angle at 1/4-chord.
-          if(angli)then
+          if(l1point)then
             thetadot = -omega*scone*r2d
             alpha_cp_34 = alpha_cp + (0.75d0-x_aoa)*chord/vrel_cp
      &                               *thetadot
@@ -582,7 +629,7 @@ c=======================================================================
       ! The definition of the smearing factor is given in Eq.(22) with
       ! the perpendicular distance between vortex element and control
       ! point defined in Eq.(21). Setting beta to zero, the expression
-      ! is greatly simplified.
+      ! is greatly simplified (Meyer Forsting et al. 2020, Sect. 2.3).
       ! Distance between CP and vortex trailing point
       dist_orth_sq = (r*h_r)**2+(delta*cos(phi))**2
       ! The smearing factor
@@ -622,20 +669,20 @@ c=======================================================================
       endif
       !------- Amplitude term -----------------
       ! The start value for the indicial function. Split into slow and 
-      ! fast decaying parts. Gamma is added later. 
-      ! Eq.(25) 
+      ! fast decaying parts. Gamma and Phi are added later. 
+      ! Eq.(25): D_X = 1.359 r/(4 pi h|h|) Phi and
+      !          D_Y = -0.359/4 r/(4 pi h|h|) Phi, i.e. negative
       dw = 1d0/(4d0*pi*abs(h)*h_r)
       nw_dx = 1.359d0*dw
-      nw_dy = 0.359d0/4d0*dw
+      nw_dy = -0.359d0/4d0*dw
       !-------- Root Correction ----------
       ! Implement the root correction that limits the induction to that 
       ! 90 degrees
-      ! Eq.(27)
-      root_corr=(nw_dx*(1d0-exp(-pi/(2d0*nw_phi)))-nw_dy* 
-     &          (1d0-exp(-2d0*pi/nw_phi)))/(nw_dx-nw_dy)      
-      ! Apply root correction 
-      nw_dx = root_corr*nw_dx
-      nw_dy = root_corr*nw_dy
+      ! Eq.(27)-(29)
+      root_corr=(nw_dx*(1d0-exp(-pi/(2d0*nw_phi)))+nw_dy*
+     &          (1d0-exp(-2d0*pi/nw_phi)))/(nw_dx+nw_dy)
+      ! Apply root correction once, through Phi: Phi_C in Eq.(31).
+      ! The amplitudes D_X and D_Y receive it via nw_phi_star.
       nw_phi = root_corr*nw_phi
 
       ! Pirrung et al. (2017b)
@@ -699,7 +746,7 @@ c=======================================================================
       nw_k_phi = min(nw_k_phi,1d0)
       nw_k_phi = max(nw_k_phi,0d0)
       ! Determine the mix of straight and curved helix
-      ! Eq. (8)
+      ! Eq. (8), with the root-corrected Phi_C (corrigendum 2020)
       nw_phi_star = nw_k_phi*nw_phi_s + (1d0-nw_k_phi)*nw_phi
 
       end subroutine nw_phi_components
@@ -747,7 +794,8 @@ c=======================================================================
 c=======================================================================
       subroutine nw_circulation(dt_global,vrel,alpha,Gamma_history,
      &                          dyn_comp_history,
-     &                          alpha_2d,cl_2d,len_2d,chord,     
+     &                          alpha_2d,cl_2d,len_2d,chord,    
+     &                          lfilter, 
      &                          Gamma_steady,Gamma,dGamma,dyn_comp)
 
 c-----------------------------------------------------------------------      
@@ -762,7 +810,8 @@ c-----[in]
       integer,intent(in)::len_2d
       real(kind=idp),intent(in)::dt_global,vrel(n_s),alpha(n_s),
      &               Gamma_history(n_s),dyn_comp_history(n_s,3),
-     &               alpha_2d(len_2d,n_s),cl_2d(len_2d,n_s),chord(n_s)      
+     &               alpha_2d(len_2d,n_s),cl_2d(len_2d,n_s),chord(n_s) 
+      logical,intent(in)::lfilter     
 c-----[out]  
       real(kind=idp),intent(out)::Gamma_steady(n_s),Gamma(n_s),
      &                            dGamma(n_v),dyn_comp(n_s,3)
@@ -780,24 +829,34 @@ c=======================================================================
       ! Calculate the steady circulation at each blade element
       Gamma_steady = 0.5d0*vrel*chord*cl_inter
       
-      !----Time filter bound circulation----
-      ! Madsen and Gaunaa (2004)
-      T0=chord/(2d0*vrel)
-      dt=dt_global/T0
-      ! Filter functions by Mac Gaunaa
-      dyn_comp(:,1)=dyn_comp_history(:,1)
-     &         *exp(-0.3064d0*dt)+0.27735d0*(Gamma_steady
-     &         +Gamma_history)*(1d0-exp(-0.3064d0*dt))
+      if (lfilter) then
+        !----Time filter bound circulation----
+        ! Madsen and Gaunaa (2004), Pirrung et al. (2017a) Eq.(15)-(19).
+        ! Meyer Forsting et al. (2019) trail the quasi-steady circulation
+        ! instead. The filter is kept, as the relaxation estimate in
+        ! nw_calc_relax (Eq.(15) and (27)) assumes it.
+        T0=chord/(2d0*vrel)
+        dt=dt_global/T0
+        ! Filter functions by Mac Gaunaa
+        dyn_comp(:,1)=dyn_comp_history(:,1)
+     &             *exp(-0.3064d0*dt)+0.27735d0*(Gamma_steady
+     &             +Gamma_history)*(1d0-exp(-0.3064d0*dt))
+  
+        dyn_comp(:,2)=dyn_comp_history(:,2)
+     &             *exp(-0.0439d0*dt)+0.0914d0*(Gamma_steady
+     &             +Gamma_history)*(1d0-exp(-0.0439d0*dt))
+        ! A3 = 0.2625, so that A1+A2+A3 = 1. Pirrung et al. (2017a)
+        ! Eq.(16) prints 0.2656, which would sum to 1.0031.
+        dyn_comp(:,3)=dyn_comp_history(:,3)
+     &             *exp(-3.227d0*dt)+0.13125d0*(Gamma_steady
+     &             +Gamma_history)*(1d0-exp(-3.227d0*dt))
+        ! Dynamic filtered circulation
+        Gamma = dyn_comp(:,1)+dyn_comp(:,2)+dyn_comp(:,3)
+      else
+         Gamma = Gamma_steady
+      endif 
 
-      dyn_comp(:,2)=dyn_comp_history(:,2)
-     &         *exp(-0.0439d0*dt)+0.0914d0*(Gamma_steady
-     &         +Gamma_history)*(1d0-exp(-0.0439d0*dt))
-      dyn_comp(:,3)=dyn_comp_history(:,3)
-     &         *exp(-3.227d0*dt)+0.13125d0*(Gamma_steady
-     &         +Gamma_history)*(1d0-exp(-3.227d0*dt))
-      ! Dynamic filtered circulation
-      Gamma = dyn_comp(:,1)+dyn_comp(:,2)+dyn_comp(:,3)
-      ! Change in Gamma between sections.At blade ends take all Gamma
+      ! Change in Gamma between sections. At blade ends take all Gamma
       ! from neighboring point. 
       dGamma(2:n_v-1) = Gamma(2:n_s)-Gamma(1:n_s-1)
       dGamma(1) = Gamma(1)
@@ -837,13 +896,14 @@ c=======================================================================
       nw_relax = 0d0
 
       !----Dynamic to steady circulation ratio----
-      ! Eq. (15)
+      ! Eq. (15), averaged over the time step (the paper evaluates it
+      ! at half a time step; both approximate the build-up from zero)
       tau=(2d0*vrel)/chord
       d=1-0.5547d0/(tau*dt_global*0.3064d0)*
      &             (1-exp(-tau*dt_global*0.3064d0))-0.1828d0/
      &             (tau*dt_global*0.0439d0)*(1-exp(-tau*dt_global
-     &              *0.0439d0))-0.2625d0/(tau*dt_global*3.2277d0)
-     &                          *(1-exp(-tau*dt_global*3.2277d0))
+     &              *0.0439d0))-0.2625d0/(tau*dt_global*3.227d0)
+     &                          *(1-exp(-tau*dt_global*3.227d0))
       
 
       !----Slow and fast decaying components---- 
@@ -858,13 +918,14 @@ c=======================================================================
       enddo
 
       !----Time derivative of induced velocities----
-      ! Eq. (27)
+      ! Eq. (27), with B_v of Eq. (28) as corrected in the corrigendum
+      ! (2020). alpha is the angle of attack, converted to radians.
       do l = 1,n_v-1
         A1 = nw_X(l,l)+nw_Y(l,l)
         A2 = nw_X(l+1,l)+nw_Y(l+1,l)
         gradw = d(l)*pi*chord(l)*(A1-A2)*
-     &                   ( (alpha(l)*vn(l))/vrel(l)+
-     &            vrel(l)/(abs(vt(l))*(vn(l)/abs(vt(l)))**2+1d0) ) 
+     &                   ( (alpha(l)*pi/180d0*vn(l))/vrel(l)+
+     &            vrel(l)/(abs(vt(l))*((vn(l)/abs(vt(l)))**2+1d0)) )
         ! Update the relaxation factor
         nw_relax = max(nw_relax,-(1d0+gradw)/(1d0-gradw))
       enddo
@@ -1055,7 +1116,8 @@ c-----[in]
       real(kind=idp)::tmp(3)=0.d0
 c=======================================================================
       do i=1,n
-         tmp(2)=vt(i); tmp(3)=vn(i)
+         ! Reset all components: tmp keeps its value between calls
+         tmp(1)=0.d0; tmp(2)=vt(i); tmp(3)=vn(i)
          call Vxyz_Vstn(tmp,1,0.d0,0.d0,0.d0,
      &                        cone,pitch,sweep(i),fbend(i))
          vstn(i,:)=tmp
