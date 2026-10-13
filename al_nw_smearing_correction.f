@@ -107,6 +107,13 @@ c        calculated from 2-D airfoil data for dihedral or coned wind
 c        turbine blades?, Wind Energ. Sci., 7, 1341–1365, 
 c        https://doi.org/10.5194/wes-7-1341-2022, 2022.
 c
+c     Li et al. (2022)
+c        Li, A., Gaunaa, M., Pirrung, G. R., Meyer Forsting, A., 
+c        and Horcas, S. G.: How should the lift and drag forces be 
+c        calculated from 2-D airfoil data for dihedral or coned wind 
+c        turbine blades?, Wind Energ. Sci., 7, 1341–1365, 
+c        https://doi.org/10.5194/wes-7-1341-2022, 2022.
+c
 c-----------------------------------------------------------------------
 
 c=======================================================================
