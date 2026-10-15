@@ -142,10 +142,37 @@ c-----------------------------------------------------------------------
       real(kind=idp)::nw_max_resid=1d-6
       ! Location of aoa computation (default value)
       real(kind=idp)::x_aoa=0.5d0
-      ! Constants of the circulation response filter
-      real(kind=idp),dimension(3)::a_Gamma,b_Gamma
-      ! Constants of the Near-wake model
-      real(kind=idp),dimension(4,5)::nw_N,nw_P
+      ! Constants of the circulation response filter (Pirrung et al. 2017a).
+      ! A3=0.2625 makes the amplitudes sum to 1; Eq. (16) prints 0.2656,
+      ! which would make their sum 1.0031.
+      real(kind=idp),parameter,dimension(3)::
+     &     a_Gamma=(/0.5547d0,0.1828d0,0.2625d0/),
+     &     b_Gamma=(/0.3064d0,0.0439d0,3.227d0/)
+      ! Near-wake constants of Pirrung et al. (2017b).
+      ! nw_P is for positive h_r (Eq. 14); nw_N is for negative h_r
+      ! (Eq. 13). Values are listed by column for Fortran array order.
+      real(kind=idp),parameter,dimension(4,5)::nw_P=reshape((/
+     & -1.64636754184988d0,-0.499006672527007d0,
+     &  3.90835606394205d0,-1.60622843516794d0,
+     &  8.14821474772595d0, 6.08465268675599d0,
+     & -18.7662330478906d0,7.42952711674470d0,
+     & -12.1784861715161d0,-15.1712005446736d0,
+     &  39.1243282362892d0,-15.8594777074799d0,
+     &  5.02652654794305d0,14.8254135311781d0,
+     & -29.4870086106427d0,11.6870163960092d0,
+     &  21.7713111885100d0,-2.42318681495122d0,
+     & -60.2947309276912d0,-195.060865844227d0/),(/4,5/)),
+     & nw_N=reshape((/
+     &  1.01933206359188d0,12.9874512870379d0,
+     & -0.690159136848837d0,-0.269253409815015d0,
+     & -0.135668151345576d0,49.9999999999916d0,
+     &  101.238775997879d0,49.9999999999843d0,
+     &  0.395524705910666d0,0.00235345218088083d0,
+     & -0.00154467589177718d0,-0.00247975579295973d0,
+     &  0.0801822997046969d0,11.3116074964299d0,
+     &  3.99520376143011d0,0.403642518874381d0,
+     &  44.8347503471217d0,3935.34323353354d0,
+     &  0.394541495293350d0,1.16610462658971d0/),(/4,5/))
       ! Variables from previous time step: For smooth transition between
       ! steps history needs to be stored
       real(kind=idp),dimension(:,:,:),allocatable::
@@ -953,11 +980,11 @@ c=======================================================================
 c-----------------------------------------------------------------------      
 c     Initialize the arrays needed in the near-wake smearing corection. 
 c-----------------------------------------------------------------------  
-      use nw_smearing_correction_module, only: nw_P,nw_N,nw_phi_s
+      use nw_smearing_correction_module, only: nw_phi_s
      &     ,nw_X_history,nw_Y_history,nw_vn_history,nw_vt_history
      &     ,nw_Gamma_history,nw_dyn_comp_history,nw_W_history,nw_phi
      &     ,nw_dx,nw_dy,nw_a,cp_loop_ind,smear_fac,kaya_refresh,kaya
-     &     ,n_blades,n_rotors,n_s,n_v,a_Gamma,b_Gamma
+     &     ,n_blades,n_rotors,n_s,n_v
       use TurbineData, only: ACLproject,aclnamelen ! Project name
       use params, only: MyProcNum ! Get the processor nr.
 c-----------------------------------------------------------------------
@@ -976,32 +1003,6 @@ c=======================================================================
       !----Nr of control and vortex trailing points----
       n_s = n_sections_in
       n_v = n_s+1
-
-      !----Unsteady circulation constants Pirrung et al. (2017a)----
-      ! Changed A3 = 0.2625, so that A1+A2+A3 = 1. 
-      ! Eq.(16) prints 0.2656, which would sum to 1.0031.
-      a_Gamma=(/0.5547d0,0.1828d0,0.2625d0/)
-      b_Gamma=(/0.3064d0,0.0439d0,3.227d0/)
-
-      !----Near-wake constants Pirrung et al. (2017b)----
-      ! Positve values of h_r given in Eq.(14)
-      nw_P(1,:)=(/-1.64636754184988d0,8.14821474772595d0, 
-     &   -12.1784861715161d0,5.02652654794305d0,21.7713111885100d0/)
-      nw_P(2,:)=(/-0.499006672527007d0,6.08465268675599d0,
-     &   -15.1712005446736d0,14.8254135311781d0,-2.42318681495122d0/)
-      nw_P(3,:)=(/3.90835606394205d0,-18.7662330478906d0,
-     &    39.1243282362892d0,-29.4870086106427d0,-60.2947309276912d0/)
-      nw_P(4,:)=(/-1.60622843516794d0,7.42952711674470d0,
-     &    -15.8594777074799d0,11.6870163960092d0,-195.060865844227d0/)
-      ! Negative values given in Eq.(13)
-      nw_N(1,:)=(/1.01933206359188d0,-0.135668151345576d0,
-     &    0.395524705910666d0,0.0801822997046969d0,44.8347503471217d0/)
-      nw_N(2,:)=(/12.9874512870379d0,49.9999999999916d0, 
-     &    0.00235345218088083d0,11.3116074964299d0,3935.34323353354d0/)
-      nw_N(3,:)=(/-0.690159136848837d0,101.238775997879d0,
-     &  -0.00154467589177718d0,3.99520376143011d0,0.394541495293350d0/)
-      nw_N(4,:)=(/-0.269253409815015d0,49.9999999999843d0,
-     &  -0.00247975579295973d0,0.403642518874381d0,1.16610462658971d0/)
 
       !================= Allocation ====================================
 
