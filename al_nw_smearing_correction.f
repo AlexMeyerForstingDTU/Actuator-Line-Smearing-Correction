@@ -142,6 +142,8 @@ c-----------------------------------------------------------------------
       real(kind=idp)::nw_max_resid=1d-6
       ! Location of aoa computation (default value)
       real(kind=idp)::x_aoa=0.5d0
+      ! Constants of the circulation response filter
+      real(kind=idp),dimension(3)::a_Gamma,b_Gamma
       ! Constants of the Near-wake model
       real(kind=idp),dimension(4,5)::nw_N,nw_P
       ! Variables from previous time step: For smooth transition between
@@ -267,7 +269,7 @@ c-----[tmp]
       logical:: nw_recompute_relax,nw_converged
       integer:: nw_sub_iter, k, l
       real(kind=idp):: dt_global, h, h_r, nw_resmax, nw_relax,
-     &                 nw_relax_safety,core_cutoff,delta,
+     &                 core_cutoff,delta,
      &                 rtc,cpu_t1,cpu_t2,
      &                 d2r=4.d0*atan(1.d0)/180.d0,
      &                 r2d=180.d0/(4.d0*atan(1.d0))
@@ -277,13 +279,14 @@ c-----[tmp]
      &               lift_cp, drag_cp, nw_section_res, nw_vn,nw_vt,
      &               nw_W, phi_cp, alpha_cp, vrel_cp, nw_W_iter,
      &               phi_cp_14, alpha_cp_14, alpha_cp_34, thetadot,
-     &               scone,ccone,tcone,v_rot,vt_rot,vn_rot,phi_cp_cyl,
+     &               scone,ccone,v_rot,vt_rot,vn_rot,phi_cp_cyl,
      &               r_cp
       real(kind=idp),dimension(n_v)::
      &               phi_vtp,vrel_vtp, dGamma_vtp,nw_dbeta,r_vtp
       real(kind=idp):: nw_dyn_comp(n_s,3), nw_vstn(n_s,3),
      &                 nw_X(n_v,n_s),nw_Y(n_v,n_s),nw_phi_star(n_v,n_s)
       real(kind=idp),dimension(n_s):: nw_Wn_iter,nw_Wt_iter
+      real(kind=idp),save:: nw_relax_safety=0.2d0
 c=======================================================================
       if(.not.kaya)return ! Switch model on/off
       r_cp=cyl_cp(:,1);r_vtp=cyl_vtp(:,1)
@@ -302,7 +305,6 @@ c=======================================================================
       !#################### INITILIZE ##################################   
 
       !========= Starting Preamble =====================================
-      nw_relax_safety = 0.2d0
       nw_recompute_relax = .true.
       nw_converged = .false.
       ! Get the global timestep of the current grid level
@@ -476,13 +478,12 @@ c=======================================================================
             !============== Relaxation factor ==========================
             if (nw_recompute_relax)then
               ! Normal velocity before tangential velocity, matching
-              ! nw_calc_relax(...,vn,vt,...)
               call nw_calc_relax(vrel_cp,alpha_cp,
      &                      vn_rot+vstn_cfd(:,3)+nw_vstn(:,3),
      &                      -(vt_rot+vstn_cfd(:,2)+nw_vstn(:,2)),
      &                      chord,dt_global,nw_dx(i,j,:,:),
      &                      nw_dy(i,j,:,:),nw_dbeta,nw_phi(i,j,:,:),
-     &                      nw_relax_safety,nw_relax)
+     &                      nw_relax_safety,lgammafilter,nw_relax)
               ! After computing it once
               nw_recompute_relax = .false.
             endif
@@ -515,6 +516,12 @@ c=======================================================================
             !----100 Iterations----
             if (nw_sub_iter.eq.100)then
               nw_recompute_relax = .true.
+              ! Increase the margin if this step has not converged
+              if (.not.nw_converged) then
+                if(nw_relax_safety.lt.0.8d0) then
+                  nw_relax_safety=nw_relax_safety+0.1d0
+                endif
+              endif
             endif
             
             !----500 Iterations----
@@ -646,7 +653,7 @@ c=======================================================================
 c=======================================================================
 c=======================================================================
       subroutine nw_hr_components(h,h_r,
-     & 	                          nw_phi,nw_phi_s,nw_dx,nw_dy,nw_a)
+     &                            nw_phi,nw_phi_s,nw_dx,nw_dy,nw_a)
 c-----------------------------------------------------------------------      
 c     Compute the components of the near-wake model that only rely on
 c     geometric definiton of the blade. Unless the blade deforms heavily
@@ -810,7 +817,7 @@ c     Determine the circulation along the lifting line, including the
 c     dynamic effects and also returns the delta in circulation. 
 c----------------------------------------------------------------------- 
       use params,only:idp ! Global precision
-      use nw_smearing_correction_module,only:n_s,n_v ! Constants
+      use nw_smearing_correction_module,only:n_s,n_v,a_Gamma,b_Gamma
 c-----------------------------------------------------------------------
       implicit none
 c-----[in]  
@@ -823,8 +830,9 @@ c-----[out]
       real(kind=idp),intent(out)::Gamma_steady(n_s),Gamma(n_s),
      &                            dGamma(n_v),dyn_comp(n_s,3)
 c-----[tmp]        
-      integer::l
-      real(kind=idp),dimension(n_s)::cl_inter,dt,T0
+      integer::l,i
+      real(kind=idp),dimension(n_s)::cl_inter,tau,
+     &                              Gamma_total,decay
 c=======================================================================
 
       !----Circulation at sections----
@@ -842,25 +850,18 @@ c=======================================================================
         ! Meyer Forsting et al. (2019) trail the quasi-steady circulation
         ! instead. The filter is kept, as the relaxation estimate in
         ! nw_calc_relax (Eq.(15) and (27)) assumes it.
-        T0=chord/(2d0*vrel)
-        dt=dt_global/T0
-        ! Filter functions by Mac Gaunaa
-        dyn_comp(:,1)=dyn_comp_history(:,1)
-     &             *exp(-0.3064d0*dt)+0.27735d0*(Gamma_steady
-     &             +Gamma_history)*(1d0-exp(-0.3064d0*dt))
-  
-        dyn_comp(:,2)=dyn_comp_history(:,2)
-     &             *exp(-0.0439d0*dt)+0.0914d0*(Gamma_steady
-     &             +Gamma_history)*(1d0-exp(-0.0439d0*dt))
-        ! A3 = 0.2625, so that A1+A2+A3 = 1. Pirrung et al. (2017a)
-        ! Eq.(16) prints 0.2656, which would sum to 1.0031.
-        dyn_comp(:,3)=dyn_comp_history(:,3)
-     &             *exp(-3.227d0*dt)+0.13125d0*(Gamma_steady
-     &             +Gamma_history)*(1d0-exp(-3.227d0*dt))
-        ! Dynamic filtered circulation
-        Gamma = dyn_comp(:,1)+dyn_comp(:,2)+dyn_comp(:,3)
+        tau=dt_global*(2d0*vrel)/chord
+        Gamma_total = Gamma_steady + Gamma_history 
+        Gamma = 0d0
+        do i=1,3
+          decay=exp(-b_Gamma(i)*tau)
+          dyn_comp(:,i)=dyn_comp_history(:,i)*decay+
+     &         a_Gamma(i)/2d0*Gamma_total*(1d0-decay)
+          Gamma = Gamma + dyn_comp(:,i)
+        enddo
       else
          Gamma = Gamma_steady
+         dyn_comp = 0d0
       endif 
 
       ! Change in Gamma between sections. At blade ends take all Gamma
@@ -874,14 +875,15 @@ c=======================================================================
 c=======================================================================
       subroutine nw_calc_relax(vrel,alpha,vn,vt,chord,dt_global,
      &                         nw_dx,nw_dy,dbeta,nw_phi,
-     &                         nw_relax_safety,nw_relax)
+     &                         nw_relax_safety,lfilter,nw_relax)
 c-----------------------------------------------------------------------      
 c     Determine the relaxation factor needed in the near wake model. 
 c     The defintions of Pirrung et al. (2017a) are used and the 
 c     corresponding equations referenced.
 c-----------------------------------------------------------------------       
       use params,only:idp ! Global precision
-      use nw_smearing_correction_module,only:pi,n_s,n_v ! Constants
+      use nw_smearing_correction_module,only:pi,n_s,n_v
+     &                                      ,a_Gamma,b_Gamma 
 c-----------------------------------------------------------------------        
       implicit none 
 c-----[in]  
@@ -892,12 +894,13 @@ c-----[in]
      &                  dbeta(n_v),nw_phi(n_v,n_s),
      %                  nw_relax_safety,chord(n_s),
      &                  vn(n_s)
+      logical,intent(in)::lfilter ! Time filter of the circulation
 c-----[out]  
       real(kind=idp),intent(out)::nw_relax
 c-----[tmp]     
       real(kind=idp)::A1,A2,gradw,tau(n_s),d(n_s),
      &                 nw_X(n_v,n_s),nw_Y(n_v,n_s)
-      integer::l,k
+      integer::l,k,i
 c=======================================================================
       !----Initialize----   
       nw_relax = 0d0
@@ -905,13 +908,14 @@ c=======================================================================
       !----Dynamic to steady circulation ratio----
       ! Eq. (15), averaged over the time step (the paper evaluates it
       ! at half a time step; both approximate the build-up from zero)
-      tau=(2d0*vrel)/chord
-      d=1-0.5547d0/(tau*dt_global*0.3064d0)*
-     &             (1-exp(-tau*dt_global*0.3064d0))-0.1828d0/
-     &             (tau*dt_global*0.0439d0)*(1-exp(-tau*dt_global
-     &              *0.0439d0))-0.2625d0/(tau*dt_global*3.227d0)
-     &                          *(1-exp(-tau*dt_global*3.227d0))
-      
+      tau=dt_global*(2d0*vrel)/chord
+      d=1d0
+      do i=1,3
+        d=d-a_Gamma(i)/(b_Gamma(i)*tau)*
+     &       (1d0-exp(-b_Gamma(i)*tau))
+      enddo
+      ! Without the filter, the whole circulation change is trailed
+      if (.not.lfilter) d=1d0
 
       !----Slow and fast decaying components---- 
       ! in-plane only (no phi_star)
@@ -953,7 +957,7 @@ c-----------------------------------------------------------------------
      &     ,nw_X_history,nw_Y_history,nw_vn_history,nw_vt_history
      &     ,nw_Gamma_history,nw_dyn_comp_history,nw_W_history,nw_phi
      &     ,nw_dx,nw_dy,nw_a,cp_loop_ind,smear_fac,kaya_refresh,kaya
-     &     ,n_blades,n_rotors,n_s,n_v ! Assign all
+     &     ,n_blades,n_rotors,n_s,n_v,a_Gamma,b_Gamma
       use TurbineData, only: ACLproject,aclnamelen ! Project name
       use params, only: MyProcNum ! Get the processor nr.
 c-----------------------------------------------------------------------
@@ -972,6 +976,12 @@ c=======================================================================
       !----Nr of control and vortex trailing points----
       n_s = n_sections_in
       n_v = n_s+1
+
+      !----Unsteady circulation constants Pirrung et al. (2017a)----
+      ! Changed A3 = 0.2625, so that A1+A2+A3 = 1. 
+      ! Eq.(16) prints 0.2656, which would sum to 1.0031.
+      a_Gamma=(/0.5547d0,0.1828d0,0.2625d0/)
+      b_Gamma=(/0.3064d0,0.0439d0,3.227d0/)
 
       !----Near-wake constants Pirrung et al. (2017b)----
       ! Positve values of h_r given in Eq.(14)
@@ -1071,7 +1081,7 @@ c-----[in]
       real(kind=idp),intent(in)::x(n),y(n),xin(nin)
 c-----[out]  
       real(kind=idp),intent(out)::yin(nin)
-c-----[in]        
+c-----[tmp]        
       integer::i,j
       real(kind=idp)::ratio
 c=======================================================================
@@ -1118,8 +1128,8 @@ c-----[in]
      &                           sweep(n),fbend(n)
 c-----[out]
       real(kind=idp),intent(out)::vstn(n,3)
-c-----[in]
-      integer::i,j
+c-----[tmp]
+      integer::i
       real(kind=idp)::tmp(3)=0.d0
 c=======================================================================
       do i=1,n
