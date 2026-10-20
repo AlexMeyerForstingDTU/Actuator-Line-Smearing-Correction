@@ -1,0 +1,2 @@
+!!!! WARNING smearing correction switched off !!!!
+First vortex trailing point is zero, please modify
