@@ -1,7 +1,7 @@
-# Actuator-line smearing correction
+# Actuator line smearing correction
 
 This repository contains implementations of a vortex-based
-smearing correction for actuator-line (AL) forces. Gaussian force smearing
+smearing correction for actuator line (AL) forces. Gaussian force smearing
 reduces the vorticity shed by the actuator line and therefore underpredicts
 the induced velocity. The routine estimates the missing near-wake induction
 and uses it to correct the angle of attack and aerodynamic forces.
